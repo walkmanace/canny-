@@ -1,0 +1,192 @@
+Canny 边缘检测上机报告（优化完整版）
+一、解题过程（优化版）
+Canny 边缘检测是一种经典且高效的图像边缘检测算法，整体流程由五个步骤构成：高斯滤波、计算梯度、非极大值抑制、双阈值检测、滞后连接。本实验基于算法原理实现了完整流程，并与 OpenCV 结果进行了对比验证。
+二、程序代码（优化版）
+```python
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import Tuple, Optional
+
+def auto_thresholds(image: np.ndarray, sigma: float = 0.33) -> Tuple[int, int]:
+    """
+    基于图像中值自动估计低/高阈值（用于快速尝试）。
+    参考常用经验法：low = max(0, (1-sigma)*median), high = min(255, (1+sigma)*median)
+    （注意：对梯度幅值也可调整）
+    """
+    med = np.median(image)
+    low = int(max(0, (1.0 - sigma) * med))
+    high = int(min(255, (1.0 + sigma) * med))
+    return low, high
+
+def non_maximum_suppression(magnitude: np.ndarray, angle: np.ndarray) -> np.ndarray:
+    """
+    向量化的非极大值抑制（支持任意大小图像，8邻域比较）
+    magnitude: 梯度幅值二维数组（float）
+    angle: 梯度方向（degree，范围 [0,180)）
+    返回：经过 NMS 之后的幅值（未归一化）——边界处为0
+    """
+    M, N = magnitude.shape
+    # 对边界处理：在周围填充0，便于切片
+    mag_p = np.pad(magnitude, ((1,1),(1,1)), mode='constant', constant_values=0)
+    # 构造邻居（相对于中心点的索引）
+    # 注意切片对应：中心在 [1:-1,1:-1]
+    c = mag_p[1:-1, 1:-1]
+    left  = mag_p[1:-1, 0:-2]
+    right = mag_p[1:-1, 2:  ]
+    up    = mag_p[0:-2, 1:-1]
+    down  = mag_p[2:  , 1:-1]
+    ul = mag_p[0:-2, 0:-2]
+    ur = mag_p[0:-2, 2:  ]
+    dl = mag_p[2:  , 0:-2]
+    dr = mag_p[2:  , 2:  ]
+
+    angle = angle % 180  # 0-180度
+    # 四个方向的掩码（0°,45°,90°,135°）
+    mask0   = (angle < 22.5) | (angle >= 157.5)
+    mask45  = (angle >= 22.5) & (angle < 67.5)
+    mask90  = (angle >= 67.5) & (angle < 112.5)
+    mask135 = (angle >= 112.5) & (angle < 157.5)
+
+    # 对应方向比较两侧邻点
+    cond0   = (c >= left) & (c >= right)
+    cond45  = (c >= ul) & (c >= dr)
+    cond90  = (c >= up) & (c >= down)
+    cond135 = (c >= ur) & (c >= dl)
+
+    keep = (mask0 & cond0) | (mask45 & cond45) | (mask90 & cond90) | (mask135 & cond135)
+    suppressed = np.zeros_like(magnitude, dtype=np.float32)
+    suppressed[keep] = magnitude[keep]
+    return suppressed
+
+def hysteresis_edge_tracking(nms: np.ndarray, low: float, high: float) -> np.ndarray:
+    """
+    使用栈实现的双阈值 + 滞后连接（连通性追踪）。
+    - nms: 非极大值抑制后的幅值（float）
+    - low, high: 低阈值和高阈值（对幅值的阈值）
+    返回 uint8 二值边缘图（0/255）
+    """
+    M, N = nms.shape
+    res = np.zeros((M, N), dtype=np.uint8)
+
+    strong = nms >= high
+    weak = (nms >= low) & (nms < high)
+
+    # 标记强边缘
+    res[strong] = 255
+    # 用栈从所有强边缘出发，追踪并连通弱边缘（8连通）
+    strong_indices = list(zip(*np.nonzero(strong)))
+    # 为避免重复访问，将 weak 转成可修改的布尔数组
+    weak_mask = weak.copy()
+
+    # 8 邻域偏移
+    neigh = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+    stack = strong_indices[:]  # 初始化栈
+    while stack:
+        i,j = stack.pop()
+        for di,dj in neigh:
+            ni, nj = i+di, j+dj
+            if 0 <= ni < M and 0 <= nj < N and weak_mask[ni,nj]:
+                # 把弱边缘升级为边缘并继续扩展
+                res[ni,nj] = 255
+                weak_mask[ni,nj] = False
+                stack.append((ni,nj))
+    return res
+
+def canny_custom(image: np.ndarray,
+                 low_threshold: Optional[float] = None,
+                 high_threshold: Optional[float] = None,
+                 kernel_size: int = 5,
+                 gaussian_sigma: float = 1.4,
+                 use_auto_threshold: bool = False) -> Tuple[np.ndarray, dict]:
+    """
+    自定义实现 Canny：高斯滤波 -> Sobel (gx, gy) -> magnitude/angle -> NMS -> 双阈值滞后连接
+    返回：边缘图（uint8 0/255）和中间结果 dict（方便绘图与保存）
+    """
+    # 1. 高斯滤波（保持单通道灰度输入）
+    blur = cv2.GaussianBlur(image, (kernel_size, kernel_size), gaussian_sigma)
+
+    # 2. Sobel 导数
+    gx = cv2.Sobel(blur, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(blur, cv2.CV_64F, 0, 1, ksize=3)
+
+    # 3. 幅值与方向
+    magnitude = np.hypot(gx, gy)
+    # 规范化幅值到 0-255（便于阈值选择与可视化）
+    mag_max = magnitude.max() if magnitude.max() != 0 else 1.0
+    magnitude_u8 = (magnitude / mag_max * 255.0).astype(np.float32)
+
+    angle = (np.degrees(np.arctan2(gy, gx)) + 180) % 180  # 0-180
+
+    # 4. 非极大值抑制（向量化实现）
+    nms = non_maximum_suppression(magnitude_u8, angle)  # 仍是 0-255 浮点数
+
+    # 5. 阈值决定
+    if use_auto_threshold:
+        low_threshold, high_threshold = auto_thresholds(nms)
+    elif low_threshold is None or high_threshold is None:
+        raise ValueError("请提供 low_threshold/high_threshold 或启用 use_auto_threshold=True")
+
+    # 6. 双阈值 + 滞后连接
+    edges = hysteresis_edge_tracking(nms, low_threshold, high_threshold)
+
+    # 中间结果打包
+    mids = {
+        'blur': blur,
+        'gx': gx,
+        'gy': gy,
+        'magnitude': magnitude_u8,
+        'nms': nms,
+        'low_threshold': low_threshold,
+        'high_threshold': high_threshold
+    }
+    return edges, mids
+
+def plot_all(original, mids, edges_custom, edges_cv2=None, figsize=(14,8)):
+    plt.figure(figsize=figsize)
+    plt.subplot(2,4,1); plt.imshow(original, cmap='gray'); plt.title('Original'); plt.axis('off')
+    plt.subplot(2,4,2); plt.imshow(mids['blur'], cmap='gray'); plt.title('Gaussian Blurred'); plt.axis('off')
+    plt.subplot(2,4,3); plt.imshow(mids['gx'], cmap='seismic'); plt.title('Gradient X'); plt.axis('off')
+    plt.subplot(2,4,4); plt.imshow(mids['gy'], cmap='seismic'); plt.title('Gradient Y'); plt.axis('off')
+    plt.subplot(2,4,5); plt.imshow(mids['magnitude'], cmap='gray'); plt.title('Gradient Magnitude'); plt.axis('off')
+    plt.subplot(2,4,6); plt.imshow(mids['nms'], cmap='gray'); plt.title('NMS'); plt.axis('off')
+    plt.subplot(2,4,7); plt.imshow(edges_custom, cmap='gray'); plt.title(f'Custom Canny\n(L={mids["low_threshold"]}, H={mids["high_threshold"]})'); plt.axis('off')
+    if edges_cv2 is not None:
+        plt.subplot(2,4,8); plt.imshow(edges_cv2, cmap='gray'); plt.title('OpenCV Canny'); plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+# 简单示例（可直接运行）
+if __name__ == "__main__":
+    import os
+    image_path = "test_image.jpg"  # 替换为你自己的输入
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        # 生成测试图像（矩形 + 圆形 + 噪声）
+        img = np.zeros((300,300), dtype=np.uint8)
+        cv2.rectangle(img, (40,40), (260,200), 200, -1)
+        cv2.circle(img, (150,230), 40, 255, -1)
+        # 添加一点噪声
+        noise = (np.random.randn(*img.shape) * 10).astype(np.int16)
+        img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+        cv2.imwrite("test_image_generated.png", img)
+
+    # 使用自定义 Canny（启用自动阈值以方便演示）
+    edges_custom, mids = canny_custom(img, use_auto_threshold=True, gaussian_sigma=1.2)
+    # 使用 OpenCV Canny 作对比（注意 OpenCV 接受的是像素强度阈值）
+    # 我们把自定义 nms 的阈值由 0-255 映射到 OpenCV 的输入尺度（此处直接用 mids 提供的阈值）
+    edges_cv2 = cv2.Canny(img, mids['low_threshold'], mids['high_threshold'])
+
+    # 保存结果
+    cv2.imwrite("canny_custom_edges.png", edges_custom)
+    cv2.imwrite("canny_opencv_edges.png", edges_cv2)
+
+    # 展示
+    plot_all(img, mids, edges_custom, edges_cv2)
+    print("完成：结果保存在当前工作目录（canny_custom_edges.png / canny_opencv_edges.png）")```
+三、输入图像（说明）
+示例程序自动生成了包含矩形与圆形的测试图像，便于验证 Canny 处理流程。
+四、中间结果及输出结果（概述）
+包括：原图、高斯滤波、X/Y 梯度、梯度幅值、非极大值抑制结果、最终边缘图，并与 OpenCV 官方实现进行了对比。
+五、上机总结（完整版）
+本次实验通过从零构建 Canny 边缘检测流程，使我对各步骤原理、实现细节与调参过程有了更深入理解，尤其是梯度方向量化、非极大值抑制方向判断、双阈值与滞后连接的具体行为。
